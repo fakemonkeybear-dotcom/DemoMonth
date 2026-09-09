@@ -66,6 +66,7 @@ def append_ledger(row):
 def main():
     wallets = load_wallets()
     seen = load_seen()
+    is_first_run = len(seen) == 0
     new_alerts = []
 
     for addr in wallets:
@@ -74,7 +75,14 @@ def main():
             continue
 
         seen_ids = set(seen.get(addr, []))
-        # hyperliquid fills have a unique 'tid' (trade id) or 'hash' - use tid
+        all_ids = set(str(f.get("tid", f.get("hash",""))) for f in fills)
+
+        if is_first_run:
+            # bootstrap: record everything as "already seen" without alerting,
+            # so we only get alerts for genuinely NEW trades going forward
+            seen[addr] = list(all_ids)
+            continue
+
         new_fills = [f for f in fills if str(f.get("tid", f.get("hash",""))) not in seen_ids]
 
         if not new_fills:
@@ -115,7 +123,9 @@ def main():
 
     save_seen(seen)
 
-    if new_alerts:
+    if is_first_run:
+        print("First run complete - baseline established for all wallets. No alerts sent this time; future runs will alert on new activity only.")
+    elif new_alerts:
         subject = f"[Wallet Monitor] {len(new_alerts)} new trade(s) detected"
         body = "\n---\n".join(new_alerts)
         send_email(subject, body)
@@ -125,4 +135,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-  
+        
