@@ -5,10 +5,11 @@ from datetime import datetime, timezone
 
 API_URL = "https://api.hyperliquid.xyz/info"
 WALLETS_FILE = "monitor_wallets.txt"
-SEEN_FILE = "state/seen_fills.json"
+LAST_SEEN_FILE = "state/last_seen_time.json"
 LEDGER_FILE = "state/paper_ledger.csv"
 
-VIRTUAL_ALLOCATION_PER_WALLET = 1000  # paper-trade $1000 "following" each wallet, adjust as you like
+VIRTUAL_ALLOCATION_PER_WALLET = 1000
+MAX_ALERTS_PER_RUN = 30  # safety circuit breaker - if we'd exceed this, something is wrong, don't spam
 
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
@@ -31,16 +32,16 @@ def load_wallets():
     with open(WALLETS_FILE) as f:
         return [l.strip() for l in f if l.strip()]
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE) as f:
+def load_last_seen():
+    if os.path.exists(LAST_SEEN_FILE):
+        with open(LAST_SEEN_FILE) as f:
             return json.load(f)
     return {}
 
-def save_seen(seen):
+def save_last_seen(d):
     os.makedirs("state", exist_ok=True)
-    with open(SEEN_FILE, "w") as f:
-        json.dump(seen, f)
+    with open(LAST_SEEN_FILE, "w") as f:
+        json.dump(d, f)
 
 def send_email(subject, body):
     if not (GMAIL_USER and GMAIL_APP_PASSWORD and ALERT_TO_EMAIL):
@@ -65,49 +66,46 @@ def append_ledger(row):
 
 def main():
     wallets = load_wallets()
-    seen = load_seen()
-    is_first_run = len(seen) == 0
+    last_seen = load_last_seen()
+    is_bootstrap = len(last_seen) == 0
     new_alerts = []
+    total_new_fills = 0
 
     for addr in wallets:
         fills = get_fills(addr)
         if not fills:
             continue
 
-        seen_ids = set(seen.get(addr, []))
-        all_ids = set(str(f.get("tid", f.get("hash",""))) for f in fills)
+        df = pd.DataFrame(fills)
+        df["time"] = pd.to_numeric(df.get("time", 0), errors="coerce")
+        max_time_this_call = int(df["time"].max())
 
-        if is_first_run:
-            # bootstrap: record everything as "already seen" without alerting,
-            # so we only get alerts for genuinely NEW trades going forward
-            seen[addr] = list(all_ids)
+        if is_bootstrap:
+            # record the latest timestamp we've seen, alert on nothing yet
+            last_seen[addr] = max_time_this_call
             continue
 
-        new_fills = [f for f in fills if str(f.get("tid", f.get("hash",""))) not in seen_ids]
+        cutoff = last_seen.get(addr, max_time_this_call)
+        new_df = df[df["time"] > cutoff]
 
-        if not new_fills:
+        if new_df.empty:
             continue
 
-        for f in new_fills:
+        total_new_fills += len(new_df)
+
+        for _, f in new_df.iterrows():
             coin = f.get("coin", "")
-            side = "BUY/LONG" if f.get("side") == "B" else "SELL/SHORT"
             direction = f.get("dir", "")
             px = f.get("px", "")
             sz = f.get("sz", "")
             closed_pnl = float(f.get("closedPnl", 0) or 0)
             ts = datetime.fromtimestamp(f.get("time", 0)/1000, tz=timezone.utc)
 
-            alert_text = (
-                f"Wallet: {addr}\n"
-                f"Coin: {coin}\n"
-                f"Action: {direction} ({side})\n"
-                f"Price: {px}  Size: {sz}\n"
-                f"Closed PnL (real): {closed_pnl}\n"
-                f"Time: {ts.isoformat()}\n"
+            new_alerts.append(
+                f"Wallet: {addr}\nCoin: {coin}\nAction: {direction}\n"
+                f"Price: {px}  Size: {sz}\nClosed PnL (real): {closed_pnl}\nTime: {ts.isoformat()}\n"
             )
-            new_alerts.append(alert_text)
 
-            # paper ledger entry
             notional = float(px or 0) * float(sz or 0)
             scale = VIRTUAL_ALLOCATION_PER_WALLET / notional if notional else 0
             append_ledger({
@@ -118,21 +116,35 @@ def main():
                 "time": ts.isoformat()
             })
 
-        seen[addr] = list(seen_ids.union(str(f.get("tid", f.get("hash",""))) for f in new_fills))
+        last_seen[addr] = max_time_this_call
         time.sleep(0.2)
 
-    save_seen(seen)
+    save_last_seen(last_seen)
 
-    if is_first_run:
-        print("First run complete - baseline established for all wallets. No alerts sent this time; future runs will alert on new activity only.")
-    elif new_alerts:
-        subject = f"[Wallet Monitor] {len(new_alerts)} new trade(s) detected"
-        body = "\n---\n".join(new_alerts)
-        send_email(subject, body)
-        print(f"{len(new_alerts)} new fills processed and alerted.")
-    else:
+    if is_bootstrap:
+        print(f"Bootstrap complete for {len(wallets)} wallets. No alerts sent. Future runs will alert on genuinely new activity only.")
+        return
+
+    if total_new_fills == 0:
         print("No new fills this run.")
+        return
+
+    if total_new_fills > MAX_ALERTS_PER_RUN:
+        # circuit breaker: something is off (huge backlog, or a bug) - send ONE
+        # summary email instead of flooding, and don't touch the ledger further this run
+        send_email(
+            f"[Wallet Monitor] WARNING: {total_new_fills} new fills detected in one run",
+            f"This is way more than expected ({MAX_ALERTS_PER_RUN} is the normal cap) - "
+            f"likely a tracking issue rather than real trading activity. "
+            f"Check state/last_seen_time.json before trusting further alerts."
+        )
+        print(f"Circuit breaker triggered - {total_new_fills} fills, sent warning only, not full digest.")
+        return
+
+    subject = f"[Wallet Monitor] {len(new_alerts)} new trade(s) detected"
+    send_email(subject, "\n---\n".join(new_alerts))
+    print(f"{len(new_alerts)} new fills processed and alerted.")
 
 if __name__ == "__main__":
     main()
-        
+            
